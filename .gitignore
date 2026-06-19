@@ -1,0 +1,24 @@
+# Binaries
+bin/
+keystone
+*.exe
+
+# Build artifacts
+*.test
+coverage.out
+coverage.html
+
+# Config (local overrides)
+config/keystone.yaml
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Logs
+*.log

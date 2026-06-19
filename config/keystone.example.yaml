@@ -1,0 +1,145 @@
+# Keystone Configuration Example
+# Copy to config/keystone.yaml and fill in your API keys
+# All keys support ${ENV_VAR} expansion for secrets
+
+server:
+  listen: ":8080"
+  read_timeout: 30s
+  write_timeout: 300s  # long for streaming responses
+  idle_timeout: 120s
+
+sessions:
+  ttl: 30m
+  header: "x-session-id"
+  auto_derive: true
+  agent_header: "x-agent"
+
+classifier:
+  mode: "normal"  # aggressive | normal | simple
+  gemini:
+    base_url: "https://generativelanguage.googleapis.com/v1beta/openai"
+    model: "gemini-2.5-flash"
+    api_key: "${GEMINI_API_KEY}"  # optional, for Phase 2 CTX MCP + Gemini classifier
+
+# Provider definitions - at least one required
+# Each provider needs a name, base_url, and at least one key
+providers:
+  - name: "zai"
+    base_url: "https://api.z.ai/v1"
+    models:
+      - "glm-5.1"
+      - "glm-4.5"
+      - "glm-4.5-air"
+    keys:
+      - key: "${ZAI_API_KEY_1}"
+        weight: 1
+      - key: "${ZAI_API_KEY_2}"
+        weight: 1
+    cooldown:
+      r429: "60s"
+      r500: "10s"
+      r401: "permanent"
+    rate_limit:
+      rpm: 60
+      tpm: 100000
+
+  - name: "nvidia"
+    base_url: "https://integrate.api.nvidia.com/v1"
+    models:
+      - "nvidia/llama-3.1-nemotron-ultra-253b-v1"
+      - "nvidia/nemotron-3-ultra"
+    keys:
+      - key: "${NVIDIA_API_KEY_1}"
+        weight: 1
+    cooldown:
+      r429: "60s"
+      r500: "10s"
+      r401: "permanent"
+
+  - name: "free"
+    base_url: "https://api.githubcopilot.com"
+    models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
+      - "claude-3.5-sonnet"
+    keys:
+      - key: "${GITHUB_COPILOT_KEY_1}"
+        weight: 1
+      - key: "${GITHUB_COPILOT_KEY_2}"
+        weight: 1
+    cooldown:
+      r429: "60s"
+      r500: "10s"
+      r401: "permanent"
+
+# Tier definitions - map tiers to models
+tiers:
+  premium:
+    models:
+      - "glm-5.1"
+  mid:
+    models:
+      - "glm-4.5"
+      - "nvidia/llama-3.1-nemotron-ultra-253b-v1"
+  coder:
+    models:
+      - "glm-4.5-air"
+      - "nvidia/nemotron-3-ultra"
+  free:
+    models:
+      - "gpt-4o"
+      - "gpt-4o-mini"
+      - "claude-3.5-sonnet"
+
+# Fallback configuration
+fallback:
+  cross_tier: true  # allow falling back to lower tiers
+  chains:
+    premium: ["zai"]
+    mid: ["zai", "nvidia"]
+    coder: ["zai", "nvidia"]
+    free: ["free"]
+
+# Model name mapping - map requested model to provider-specific names
+model_map:
+  "glm-5.1":
+    zai: "glm-5.1"
+  "glm-4.5":
+    zai: "glm-4.5"
+  "glm-4.5-air":
+    zai: "glm-4.5-air"
+  "nvidia/llama-3.1-nemotron-ultra-253b-v1":
+    nvidia: "nvidia/llama-3.1-nemotron-ultra-253b-v1"
+  "nvidia/nemotron-3-ultra":
+    nvidia: "nvidia/nemotron-3-ultra"
+  "gpt-4o":
+    free: "gpt-4o"
+  "gpt-4o-mini":
+    free: "gpt-4o-mini"
+  "claude-3.5-sonnet":
+    free: "claude-3.5-sonnet"
+
+# Agent-specific tier floors (minimum tier for each agent)
+# Agents can only use this tier or higher (more expensive)
+agent_tiers:
+  "coder": "coder"
+  "researcher": "mid"
+  "analyst": "mid"
+  "default": "free"
+
+# Economics engine configuration
+economics:
+  sticky_min_turns: 3
+  sticky_min_context: 50000
+  cache_hit_ratio: 0.7
+
+metrics:
+  prometheus: true
+  path: "/metrics"
+
+api:
+  enabled: true
+  base_path: "/api"
+
+redis:
+  url: "${REDIS_URL}"  # optional, for distributed session store
