@@ -23,8 +23,8 @@ type Decision struct {
 	Downgrade  bool
 }
 
-func (e *Engine) Decide(c *classify.Result, s *session.Session, agent string) *Decision {
-	targetTier := e.determineTier(c, agent)
+func (e *Engine) Decide(c *classify.Result, s *session.Session, agent string, requestedModel string) *Decision {
+	targetTier := e.determineTier(c, agent, requestedModel)
 	sticky := e.shouldStaySticky(c, s, targetTier)
 
 	reason := fmt.Sprintf("tier_%s_%s", targetTier, c.Complexity)
@@ -46,16 +46,80 @@ func (e *Engine) Decide(c *classify.Result, s *session.Session, agent string) *D
 	}
 }
 
-func (e *Engine) determineTier(c *classify.Result, agent string) string {
-	if agentTier, ok := e.Config.AgentTiers[agent]; ok {
-		tier := e.determineComplexityTier(c)
-		if tierRank(agentTier) > tierRank(tier) {
-			return agentTier
-		}
-		return tier
+func (e *Engine) determineTier(c *classify.Result, agent string, requestedModel string) string {
+	modelTier := ""
+	if requestedModel != "" {
+		modelTier = e.modelTier(requestedModel)
 	}
 
-	return e.determineComplexityTier(c)
+	if agentTier, ok := e.Config.AgentTiers[agent]; ok {
+		tier := e.determineComplexityTier(c)
+		// Use the highest of: agent floor, model tier, complexity tier
+		rank := tierRank(tier)
+		if tierRank(agentTier) > rank {
+			rank = tierRank(agentTier)
+		}
+		if tierRank(modelTier) > rank {
+			rank = tierRank(modelTier)
+		}
+		return tierFromRank(rank)
+	}
+
+	// No agent tier floor: use max of model tier and complexity tier
+	complexityTier := e.determineComplexityTier(c)
+	if tierRank(modelTier) > tierRank(complexityTier) {
+		return modelTier
+	}
+	return complexityTier
+}
+
+func (e *Engine) modelTier(model string) string {
+	// First check model_map to resolve the actual provider model name
+	resolvedModel := model
+	if e.Config.ModelMap != nil {
+		if mapping, ok := e.Config.ModelMap[model]; ok {
+			for _, m := range mapping {
+				if m != "" {
+					resolvedModel = m
+					break
+				}
+			}
+		}
+	}
+	
+	// Check tier configs ONLY (not fallback chains) for model -> tier mapping
+	// Return the highest tier that contains this model
+	var highestTier string
+	highestRank := -1
+	for _, m := range []string{model, resolvedModel} {
+		for tier, tierCfg := range e.Config.Tiers {
+			for _, tm := range tierCfg.Models {
+				if tm == m {
+					rank := tierRank(tier)
+					if rank > highestRank {
+						highestRank = rank
+						highestTier = tier
+					}
+				}
+			}
+		}
+	}
+	return highestTier
+}
+
+func tierFromRank(rank int) string {
+	switch rank {
+	case 0:
+		return "free"
+	case 1:
+		return "mid"
+	case 2:
+		return "coder"
+	case 3:
+		return "premium"
+	default:
+		return "mid"
+	}
 }
 
 func (e *Engine) determineComplexityTier(c *classify.Result) string {
@@ -109,9 +173,9 @@ func tierRank(tier string) int {
 	case "mid":
 		return 1
 	case "coder":
-		return 1
-	case "premium":
 		return 2
+	case "premium":
+		return 3
 	default:
 		return 1
 	}

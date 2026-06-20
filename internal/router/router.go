@@ -99,10 +99,10 @@ func (r *Router) SelectForTier(tier string) (*Decision, error) {
 func NextLowerTier(tier string) string {
 	switch tier {
 	case "premium":
+		return "coder"
+	case "coder":
 		return "mid"
 	case "mid":
-		return "free"
-	case "coder":
 		return "free"
 	default:
 		return ""
@@ -116,9 +116,9 @@ func TierRank(tier string) int {
 	case "mid":
 		return 1
 	case "coder":
-		return 1
-	case "premium":
 		return 2
+	case "premium":
+		return 3
 	default:
 		return 1
 	}

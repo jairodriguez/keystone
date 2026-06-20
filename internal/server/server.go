@@ -94,7 +94,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		sess.TurnCount,
 	)
 
-	econDecision := s.Econ.Decide(clsResult, sess, agent)
+	econDecision := s.Econ.Decide(clsResult, sess, agent, requestedModel)
 
 	var decision *router.Decision
 	sticky := false
@@ -317,6 +317,23 @@ func (s *Server) getCooldownDuration(providerName string, statusCode int) time.D
 }
 
 func (s *Server) tryFallback(current *router.Decision, tier, model string) *router.Decision {
+	// First try another key from the same provider
+	p := current.Provider
+	if p.Pool.IsHealthy() {
+		key, err := p.Pool.Select()
+		if err == nil && key.ID != current.Key.ID {
+			resolved := provider.ResolveModelName(model, p.Name, s.Config.ModelMap)
+			return &router.Decision{
+				Tier:     tier,
+				Provider: p,
+				Key:      key,
+				Model:    resolved,
+				Sticky:   false,
+				Reason:   "key_rotation_" + p.Name,
+			}
+		}
+	}
+
 	lower := router.NextLowerTier(tier)
 	if lower != "" && s.Config.Fallback.CrossTier {
 		dec, err := s.Router.SelectProviderAndKey(lower, model)
