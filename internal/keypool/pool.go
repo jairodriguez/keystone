@@ -127,7 +127,7 @@ func (p *Pool) TriggerCooldown(keyID string, statusCode int, duration time.Durat
 			k.State = StateCooling
 			k.CooldownUntil = time.Now().Add(duration)
 			k.Last429 = time.Now()
-		case 500, 502, 503:
+		case 400, 404, 402, 500, 502, 503:
 			k.State = StateCooling
 			k.CooldownUntil = time.Now().Add(duration)
 		}

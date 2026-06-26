@@ -24,10 +24,11 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Listen      string        `yaml:"listen"`
-	ReadTimeout time.Duration `yaml:"read_timeout"`
+	Listen       string        `yaml:"listen"`
+	ReadTimeout  time.Duration `yaml:"read_timeout"`
 	WriteTimeout time.Duration `yaml:"write_timeout"`
 	IdleTimeout  time.Duration `yaml:"idle_timeout"`
+	ProxyTimeout time.Duration `yaml:"proxy_timeout"`
 }
 
 type SessionConfig struct {
@@ -108,6 +109,7 @@ func Default() *Config {
 			ReadTimeout:  30 * time.Second,
 			WriteTimeout: 300 * time.Second,
 			IdleTimeout:  120 * time.Second,
+			ProxyTimeout: 120 * time.Second,
 		},
 		Sessions: SessionConfig{
 			TTL:        30 * time.Minute,

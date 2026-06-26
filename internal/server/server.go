@@ -15,37 +15,44 @@ import (
 	"github.com/clawdbot/keystone/internal/keypool"
 	"github.com/clawdbot/keystone/internal/metrics"
 	"github.com/clawdbot/keystone/internal/provider"
+	"github.com/clawdbot/keystone/internal/registry"
 	"github.com/clawdbot/keystone/internal/router"
 	"github.com/clawdbot/keystone/internal/session"
 	"github.com/rs/zerolog/log"
 )
 
+
 type Server struct {
-	Config     *config.Config
-	Registry   *provider.Registry
-	Router     *router.Router
-	SessionMgr *session.Manager
-	Econ       *economics.Engine
-	Classifier classify.Classifier
-	API        *apiAdapter
-	client     *http.Client
+	Config      *config.Config
+	Registry    *provider.Registry
+	Router      *router.Router
+	ModelReg    *registry.ModelRegistry
+	SessionMgr  *session.Manager
+	Econ        *economics.Engine
+	Classifier  classify.Classifier
+	API         *apiAdapter
+	client      *http.Client
 }
 
 type apiAdapter struct {
 	GetMode func() string
 }
 
-func New(cfg *config.Config, reg *provider.Registry, rt *router.Router, sm *session.Manager, econ *economics.Engine, cls classify.Classifier, modeFn func() string) *Server {
+func New(cfg *config.Config, reg *provider.Registry, rt *router.Router, modelReg *registry.ModelRegistry, sm *session.Manager, econ *economics.Engine, cls classify.Classifier, modeFn func() string) *Server {
 	return &Server{
 		Config:     cfg,
 		Registry:   reg,
 		Router:     rt,
+		ModelReg:   modelReg,
 		SessionMgr: sm,
 		Econ:       econ,
 		Classifier: cls,
 		API:        &apiAdapter{GetMode: modeFn},
 		client: &http.Client{
 			Timeout: 0,
+			Transport: &http.Transport{
+				ResponseHeaderTimeout: cfg.Server.ProxyTimeout,
+			},
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -80,6 +87,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	isAuto := requestedModel == "auto"
+	if isAuto {
+		requestedModel = ""
+	}
+
 	sessionID := s.SessionMgr.ResolveSessionID(
 		r.Header.Get(s.Config.Sessions.Header),
 		string(bodyBytes),
@@ -99,29 +111,44 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var decision *router.Decision
 	sticky := false
 
-	if econDecision.Sticky && sess.IsStickyEligible() && sess.Provider != "" {
-		prov, ok := s.Registry.Get(sess.Provider)
-		if ok {
-			key, err := prov.Pool.SelectSpecific(sess.Key.ID)
-			if err == nil && key.State == keypool.StateHealthy {
-				resolved := provider.ResolveModelName(sess.Model, sess.Provider, s.Config.ModelMap)
-				prov, _ := s.Registry.Get(sess.Provider)
-				decision = &router.Decision{
-					Tier:     sess.Tier,
-					Provider: prov,
-					Key:      key,
-					Model:    resolved,
-					Sticky:   true,
-					Reason:   "session_sticky",
+	// Helper to check if a model is valid for a tier
+	modelValidForTier := func(model, tier string) bool {
+		if tierCfg, ok := s.Config.Tiers[tier]; ok {
+			for _, m := range tierCfg.Models {
+				if m == model {
+					return true
 				}
-				sticky = true
-				metrics.StickyDecisions.WithLabelValues("sticky").Inc()
+			}
+		}
+		return false
+	}
+
+	if econDecision.Sticky && sess.IsStickyEligible() && sess.Provider != "" {
+		// Only use sticky if the session's model is valid for the new tier
+		if modelValidForTier(sess.Model, econDecision.Tier) {
+			prov, ok := s.Registry.Get(sess.Provider)
+			if ok {
+				key, err := prov.Pool.SelectSpecific(sess.Key.ID)
+				if err == nil && key.State == keypool.StateHealthy {
+					resolved := provider.ResolveModelName(sess.Model, sess.Provider, s.Config.ModelMap)
+					prov, _ := s.Registry.Get(sess.Provider)
+					decision = &router.Decision{
+						Tier:     sess.Tier,
+						Provider: prov,
+						Key:      key,
+						Model:    resolved,
+						Sticky:   true,
+						Reason:   "session_sticky",
+					}
+					sticky = true
+					metrics.StickyDecisions.WithLabelValues("sticky").Inc()
+				}
 			}
 		}
 	}
 
 	if decision == nil {
-		decision, err = s.Router.SelectProviderAndKey(econDecision.Tier, requestedModel)
+		decision, err = s.Router.SelectProviderAndKey(econDecision.Tier, requestedModel, sess.ContextEst)
 		if err != nil {
 			log.Error().Err(err).Str("tier", econDecision.Tier).Str("model", requestedModel).Msg("all providers exhausted")
 			metrics.RequestsTotal.WithLabelValues("none", econDecision.Tier, requestedModel, "503").Inc()
@@ -156,7 +183,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			log.Error().Err(err).Str("provider", decision.Provider.Name).Msg("upstream request failed")
 			s.triggerCooldown(decision, 502)
-			decision = s.tryFallback(decision, econDecision.Tier, requestedModel)
+			decision = s.tryFallback(decision, econDecision.Tier, requestedModel, sess.ContextEst)
 			if decision == nil {
 				metrics.RequestsTotal.WithLabelValues("none", econDecision.Tier, requestedModel, "502").Inc()
 				http.Error(w, "upstream unavailable", http.StatusBadGateway)
@@ -165,12 +192,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 
-		if resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 401 || resp.StatusCode == 403 {
+		if resp.StatusCode == 429 || resp.StatusCode == 500 || resp.StatusCode == 502 || resp.StatusCode == 503 || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 || resp.StatusCode == 402 {
 			cooldownDur := s.getCooldownDuration(decision.Provider.Name, resp.StatusCode)
 			s.triggerCooldownWithCode(decision, resp.StatusCode, cooldownDur)
 
 			originalProvider := decision.Provider.Name
-			decision = s.tryFallback(decision, econDecision.Tier, requestedModel)
+			decision = s.tryFallback(decision, econDecision.Tier, requestedModel, sess.ContextEst)
 			if decision == nil {
 				resp.Body.Close()
 				metrics.RequestsTotal.WithLabelValues(originalProvider, econDecision.Tier, requestedModel, strconv.Itoa(resp.StatusCode)).Inc()
@@ -187,6 +214,39 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			metrics.FallbackTotal.WithLabelValues(originalProvider, decision.Provider.Name, econDecision.Tier).Inc()
 			resp.Body.Close()
 			continue
+		}
+
+		if resp.StatusCode == 400 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			bodyStr := string(body)
+			if isContextLengthError(bodyStr) || isUnknownModelError(bodyStr) {
+				reason := "context length exceeded"
+				if isUnknownModelError(bodyStr) {
+					reason = "unknown model"
+				}
+				log.Warn().
+					Str("session", sessionID).
+					Str("provider", decision.Provider.Name).
+					Str("model", decision.Model).
+					Str("tier", econDecision.Tier).
+					Str("body_preview", bodyStr[:min(200, len(bodyStr))]).
+					Msg(reason + ", attempting fallback")
+
+				// Cool the key briefly so the router doesn't cycle back to it
+				s.triggerCooldownWithCode(decision, 400, 30*time.Second)
+
+				originalProvider := decision.Provider.Name
+				decision = s.tryContextFallback(decision, econDecision.Tier, sess.ContextEst)
+				if decision != nil {
+					metrics.FallbackTotal.WithLabelValues(originalProvider, decision.Provider.Name, econDecision.Tier).Inc()
+					continue
+				}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			w.Write(body)
+			return
 		}
 
 		for k, vv := range resp.Header {
@@ -316,7 +376,7 @@ func (s *Server) getCooldownDuration(providerName string, statusCode int) time.D
 	return dur
 }
 
-func (s *Server) tryFallback(current *router.Decision, tier, model string) *router.Decision {
+func (s *Server) tryFallback(current *router.Decision, tier, model string, contextTokens int) *router.Decision {
 	// First try another key from the same provider
 	p := current.Provider
 	if p.Pool.IsHealthy() {
@@ -336,7 +396,7 @@ func (s *Server) tryFallback(current *router.Decision, tier, model string) *rout
 
 	lower := router.NextLowerTier(tier)
 	if lower != "" && s.Config.Fallback.CrossTier {
-		dec, err := s.Router.SelectProviderAndKey(lower, model)
+		dec, err := s.Router.SelectProviderAndKey(lower, "", contextTokens)
 		if err == nil {
 			return dec
 		}
@@ -355,18 +415,115 @@ func (s *Server) tryFallback(current *router.Decision, tier, model string) *rout
 		if !ok || !p.Pool.IsHealthy() {
 			continue
 		}
-		key, err := p.Pool.Select()
-		if err != nil {
-			continue
+		// Let the router pick the appropriate model for this tier
+		dec, err := s.Router.SelectProviderAndKey(tier, "", contextTokens)
+		if err == nil && dec.Provider.Name == p.Name {
+			return dec
 		}
-		resolved := provider.ResolveModelName(model, p.Name, s.Config.ModelMap)
-		return &router.Decision{
-			Tier:     tier,
-			Provider: p,
-			Key:      key,
-			Model:    resolved,
-			Sticky:   false,
-			Reason:   "fallback_from_" + current.Provider.Name,
+	}
+
+	return nil
+}
+
+func isContextLengthError(body string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "context_length") ||
+		strings.Contains(lower, "context length") ||
+		strings.Contains(lower, "maximum context") ||
+		strings.Contains(lower, "max context") ||
+		strings.Contains(lower, "token limit") ||
+		strings.Contains(lower, "too many tokens") ||
+		strings.Contains(lower, "reduce the length")
+}
+
+func isUnknownModelError(body string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "unknown model") ||
+		strings.Contains(lower, "model not found") ||
+		strings.Contains(lower, "model does not exist") ||
+		strings.Contains(lower, "invalid model") ||
+		strings.Contains(lower, "not a valid model") ||
+		strings.Contains(lower, "model_code") ||
+		strings.Contains(lower, "please check the model code") ||
+		strings.Contains(lower, "single tool-calls") ||
+		strings.Contains(lower, "tool calls not supported") ||
+		strings.Contains(lower, "reasoning_content")
+}
+
+func (s *Server) tryContextFallback(current *router.Decision, tier string, contextTokens int) *router.Decision {
+	chain, ok := s.Config.Fallback.Chains[tier]
+	if ok {
+		for _, provName := range chain {
+			if provName == current.Provider.Name {
+				continue
+			}
+			p, ok := s.Registry.Get(provName)
+			if !ok || !p.Pool.IsHealthy() {
+				continue
+			}
+			key, err := p.Pool.Select()
+			if err != nil {
+				continue
+			}
+			tierCfg, hasTier := s.Config.Tiers[tier]
+			if hasTier {
+				for _, modelID := range tierCfg.Models {
+					if s.ModelReg != nil {
+						mc := s.ModelReg.GetModel(modelID)
+						if mc != nil && mc.ContextWindow > 0 && mc.ContextWindow >= contextTokens {
+							if p.HasModel(modelID) {
+								resolved := provider.ResolveModelName(modelID, p.Name, s.Config.ModelMap)
+								return &router.Decision{
+									Tier:     tier,
+									Provider: p,
+									Key:      key,
+									Model:    resolved,
+									Sticky:   false,
+									Reason:   "context_fallback_" + p.Name,
+								}
+							}
+						}
+					}
+				}
+			}
+			// Use the first tier model this provider supports
+			if hasTier {
+				for _, modelID := range tierCfg.Models {
+					if p.HasModel(modelID) {
+						resolved := provider.ResolveModelName(modelID, p.Name, s.Config.ModelMap)
+						return &router.Decision{
+							Tier:     tier,
+							Provider: p,
+							Key:      key,
+							Model:    resolved,
+							Sticky:   false,
+							Reason:   "context_fallback_" + p.Name,
+						}
+					}
+				}
+			}
+			// If no tier models matched, still try with any model the provider supports
+			dec, err := s.Router.SelectProviderAndKey(tier, "", contextTokens)
+			if err == nil && dec.Provider.Name == provName {
+				return dec
+			}
+		}
+	}
+
+	higher := router.NextHigherTier(tier)
+	if higher != "" {
+		dec, err := s.Router.SelectProviderAndKey(higher, "", contextTokens)
+		if err == nil {
+			log.Info().Str("from_tier", tier).Str("to_tier", higher).Msg("context fallback upgraded tier")
+			return dec
+		}
+	}
+
+	lower := router.NextLowerTier(tier)
+	if lower != "" {
+		dec, err := s.Router.SelectProviderAndKey(lower, "", contextTokens)
+		if err == nil {
+			return dec
 		}
 	}
 

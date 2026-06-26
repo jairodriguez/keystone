@@ -47,29 +47,21 @@ func (e *Engine) Decide(c *classify.Result, s *session.Session, agent string, re
 }
 
 func (e *Engine) determineTier(c *classify.Result, agent string, requestedModel string) string {
-	modelTier := ""
-	if requestedModel != "" {
-		modelTier = e.modelTier(requestedModel)
-	}
+	complexityTier := e.determineComplexityTier(c)
 
 	if agentTier, ok := e.Config.AgentTiers[agent]; ok {
-		tier := e.determineComplexityTier(c)
-		// Use the highest of: agent floor, model tier, complexity tier
-		rank := tierRank(tier)
-		if tierRank(agentTier) > rank {
-			rank = tierRank(agentTier)
+		if tierRank(agentTier) > tierRank(complexityTier) {
+			complexityTier = agentTier
 		}
-		if tierRank(modelTier) > rank {
-			rank = tierRank(modelTier)
-		}
-		return tierFromRank(rank)
 	}
 
-	// No agent tier floor: use max of model tier and complexity tier
-	complexityTier := e.determineComplexityTier(c)
-	if tierRank(modelTier) > tierRank(complexityTier) {
-		return modelTier
+	if requestedModel != "" && requestedModel != "auto" {
+		modelTier := e.modelTier(requestedModel)
+		if modelTier != "" && tierRank(modelTier) > tierRank(complexityTier) {
+			complexityTier = modelTier
+		}
 	}
+
 	return complexityTier
 }
 

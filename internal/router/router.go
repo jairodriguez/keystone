@@ -6,6 +6,7 @@ import (
 	"github.com/clawdbot/keystone/internal/config"
 	"github.com/clawdbot/keystone/internal/keypool"
 	"github.com/clawdbot/keystone/internal/provider"
+	"github.com/clawdbot/keystone/internal/registry"
 )
 
 type Decision struct {
@@ -31,15 +32,16 @@ func (d *Decision) String() string {
 }
 
 type Router struct {
-	Registry  *provider.Registry
-	Config    *config.Config
+	Registry   *provider.Registry
+	Config     *config.Config
+	ModelReg   *registry.ModelRegistry
 }
 
-func New(reg *provider.Registry, cfg *config.Config) *Router {
-	return &Router{Registry: reg, Config: cfg}
+func New(reg *provider.Registry, cfg *config.Config, modelReg *registry.ModelRegistry) *Router {
+	return &Router{Registry: reg, Config: cfg, ModelReg: modelReg}
 }
 
-func (r *Router) SelectProviderAndKey(tier, model string) (*Decision, error) {
+func (r *Router) SelectProviderAndKey(tier, model string, contextTokens int) (*Decision, error) {
 	chain, ok := r.Config.Fallback.Chains[tier]
 	if !ok || len(chain) == 0 {
 		providers := r.Registry.FindProvidersForModel(model)
@@ -52,6 +54,59 @@ func (r *Router) SelectProviderAndKey(tier, model string) (*Decision, error) {
 		}
 	}
 
+	// Check which models are valid for this tier
+	tierModels := map[string]bool{}
+	if tierCfg, ok := r.Config.Tiers[tier]; ok {
+		for _, m := range tierCfg.Models {
+			tierModels[m] = true
+		}
+	}
+
+	// Build list of models to try: requested model first (if in tier), then tier defaults
+	var modelsToTry []string
+	if len(tierModels) > 0 {
+		for _, m := range []string{model} {
+			if tierModels[m] {
+				modelsToTry = append(modelsToTry, m)
+			}
+		}
+		for m := range tierModels {
+			if m != model {
+				modelsToTry = append(modelsToTry, m)
+			}
+		}
+	} else {
+		modelsToTry = []string{model}
+	}
+
+	for _, tryModel := range modelsToTry {
+		// Check context window if model registry is available
+		if r.ModelReg != nil && contextTokens > 0 {
+			if modelConfig := r.ModelReg.GetModel(tryModel); modelConfig != nil {
+				if contextTokens > modelConfig.ContextWindow {
+					continue // Skip this model, context too large
+				}
+			}
+		}
+
+		dec, err := r.tryChain(chain, tier, tryModel)
+		if err == nil {
+			return dec, nil
+		}
+	}
+
+	// Cross-tier fallback
+	if r.Config.Fallback.CrossTier {
+		lower := NextLowerTier(tier)
+		if lower != "" {
+			return r.SelectProviderAndKey(lower, model, contextTokens)
+		}
+	}
+
+	return nil, fmt.Errorf("all providers exhausted for tier %s model %s", tier, model)
+}
+
+func (r *Router) tryChain(chain []string, tier, model string) (*Decision, error) {
 	for _, provName := range chain {
 		p, ok := r.Registry.Get(provName)
 		if !ok {
@@ -77,23 +132,15 @@ func (r *Router) SelectProviderAndKey(tier, model string) (*Decision, error) {
 			Reason:   "selected_" + p.Name,
 		}, nil
 	}
-
-	if r.Config.Fallback.CrossTier {
-		lower := NextLowerTier(tier)
-		if lower != "" {
-			return r.SelectProviderAndKey(lower, model)
-		}
-	}
-
-	return nil, fmt.Errorf("all providers exhausted for tier %s model %s", tier, model)
+	return nil, fmt.Errorf("no available provider in chain for model %s", model)
 }
 
 func (r *Router) SelectForTier(tier string) (*Decision, error) {
 	tierCfg, ok := r.Config.Tiers[tier]
 	if !ok || len(tierCfg.Models) == 0 {
-		return r.SelectProviderAndKey(tier, "")
+		return r.SelectProviderAndKey(tier, "", 0)
 	}
-	return r.SelectProviderAndKey(tier, tierCfg.Models[0])
+	return r.SelectProviderAndKey(tier, tierCfg.Models[0], 0)
 }
 
 func NextLowerTier(tier string) string {
@@ -104,6 +151,19 @@ func NextLowerTier(tier string) string {
 		return "mid"
 	case "mid":
 		return "free"
+	default:
+		return ""
+	}
+}
+
+func NextHigherTier(tier string) string {
+	switch tier {
+	case "free":
+		return "mid"
+	case "mid":
+		return "coder"
+	case "coder":
+		return "premium"
 	default:
 		return ""
 	}
