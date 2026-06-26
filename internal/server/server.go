@@ -411,13 +411,8 @@ func (s *Server) tryFallback(current *router.Decision, tier, model string, conte
 		if provName == current.Provider.Name {
 			continue
 		}
-		p, ok := s.Registry.Get(provName)
-		if !ok || !p.Pool.IsHealthy() {
-			continue
-		}
-		// Let the router pick the appropriate model for this tier
-		dec, err := s.Router.SelectProviderAndKey(tier, "", contextTokens)
-		if err == nil && dec.Provider.Name == p.Name {
+		dec, err := s.Router.SelectForProvider(tier, provName)
+		if err == nil {
 			return dec
 		}
 	}

@@ -135,6 +135,41 @@ func (r *Router) tryChain(chain []string, tier, model string) (*Decision, error)
 	return nil, fmt.Errorf("no available provider in chain for model %s", model)
 }
 
+func (r *Router) SelectForProvider(tier, providerName string) (*Decision, error) {
+	p, ok := r.Registry.Get(providerName)
+	if !ok {
+		return nil, fmt.Errorf("provider %s not found", providerName)
+	}
+	if !p.Pool.IsHealthy() {
+		return nil, fmt.Errorf("provider %s has no healthy keys", providerName)
+	}
+
+	tierCfg, ok := r.Config.Tiers[tier]
+	if !ok || len(tierCfg.Models) == 0 {
+		return nil, fmt.Errorf("tier %s has no models", tier)
+	}
+
+	for _, m := range tierCfg.Models {
+		if p.HasModel(m) {
+			key, err := p.Pool.Select()
+			if err != nil {
+				continue
+			}
+			modelName := provider.ResolveModelName(m, p.Name, r.Config.ModelMap)
+			return &Decision{
+				Tier:     tier,
+				Provider: p,
+				Key:      key,
+				Model:    modelName,
+				Sticky:   false,
+				Reason:   "selected_" + p.Name,
+			}, nil
+		}
+	}
+
+	return nil, fmt.Errorf("provider %s has no models in tier %s", providerName, tier)
+}
+
 func (r *Router) SelectForTier(tier string) (*Decision, error) {
 	tierCfg, ok := r.Config.Tiers[tier]
 	if !ok || len(tierCfg.Models) == 0 {
