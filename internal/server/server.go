@@ -220,7 +220,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			bodyStr := string(body)
-			if isContextLengthError(bodyStr) || isUnknownModelError(bodyStr) {
+			if isContextLengthError(bodyStr) || isUnknownModelError(bodyStr) || isResourceExhaustedError(bodyStr) {
 				reason := "context length exceeded"
 				if isUnknownModelError(bodyStr) {
 					reason = "unknown model"
@@ -245,6 +245,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(400)
+			w.Write(body)
+			return
+		}
+
+		if resp.StatusCode >= 300 {
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			bodyStr := string(body)
+			if isResourceExhaustedError(bodyStr) || isUnknownModelError(bodyStr) {
+				log.Warn().
+					Str("provider", decision.Provider.Name).
+					Int("status", resp.StatusCode).
+					Str("body_preview", bodyStr[:min(200, len(bodyStr))]).
+					Msg("upstream error, attempting fallback")
+				s.triggerCooldownWithCode(decision, resp.StatusCode, 60*time.Second)
+				originalProvider := decision.Provider.Name
+				decision = s.tryFallback(decision, econDecision.Tier, requestedModel, sess.ContextEst)
+				if decision != nil {
+					metrics.FallbackTotal.WithLabelValues(originalProvider, decision.Provider.Name, econDecision.Tier).Inc()
+					continue
+				}
+			}
+			metrics.RequestsTotal.WithLabelValues(decision.Provider.Name, econDecision.Tier, requestedModel, strconv.Itoa(resp.StatusCode)).Inc()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(resp.StatusCode)
 			w.Write(body)
 			return
 		}
@@ -417,7 +442,22 @@ func (s *Server) tryFallback(current *router.Decision, tier, model string, conte
 		}
 	}
 
+	// All same-tier providers exhausted — promote to the next higher tier
+	if higher := router.NextHigherTier(tier); higher != "" && s.Config.Fallback.CrossTier {
+		dec, err := s.Router.SelectProviderAndKey(higher, "", contextTokens)
+		if err == nil {
+			return dec
+		}
+	}
+
 	return nil
+}
+
+func isResourceExhaustedError(body string) bool {
+	lower := strings.ToLower(body)
+	return strings.Contains(lower, "resourceexhausted") ||
+		strings.Contains(lower, "worker local total request limit") ||
+		strings.Contains(lower, "request limit reached")
 }
 
 func isContextLengthError(body string) bool {
