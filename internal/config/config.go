@@ -11,6 +11,7 @@ import (
 type Config struct {
 	Server    ServerConfig    `yaml:"server"`
 	Sessions  SessionConfig   `yaml:"sessions"`
+	ZenProxy  ZenProxyConfig  `yaml:"zen_proxy"`
 	Classifier ClassifierConfig `yaml:"classifier"`
 	Providers []ProviderConfig `yaml:"providers"`
 	Tiers     map[string]TierConfig `yaml:"tiers"`
@@ -21,6 +22,11 @@ type Config struct {
 	Metrics   MetricsConfig   `yaml:"metrics"`
 	API       APIConfig       `yaml:"api"`
 	Redis     RedisConfig     `yaml:"redis"`
+}
+
+type ZenProxyConfig struct {
+	Enabled bool   `yaml:"enabled"`
+	Listen  string `yaml:"listen"`
 }
 
 type ServerConfig struct {

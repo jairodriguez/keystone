@@ -125,6 +125,11 @@ func RewriteRequest(req *http.Request, provider *Provider, key *keypool.Key, mod
 			if currentModel, ok := body["model"].(string); ok && currentModel != modelName {
 				body["model"] = modelName
 			}
+			// Strip parameters that the target model/provider may not support.
+			// These are model-specific extensions that cause 400s when sent to models that don't understand them.
+			delete(body, "thinking")
+			delete(body, "reasoning_effort")
+			delete(body, "reasoning")
 			newBytes, _ := json.Marshal(body)
 			req.Body = io.NopCloser(bytes.NewReader(newBytes))
 			req.ContentLength = int64(len(newBytes))

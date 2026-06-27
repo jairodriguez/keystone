@@ -150,7 +150,47 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if decision == nil {
 		decision, err = s.Router.SelectProviderAndKey(econDecision.Tier, requestedModel, sess.ContextEst)
 		if err != nil {
-			log.Error().Err(err).Str("tier", econDecision.Tier).Str("model", requestedModel).Msg("all providers exhausted")
+			// If the specific model wasn't found, try auto-routing (pick any model from the tier)
+			if requestedModel != "" && requestedModel != "auto" {
+				log.Info().Str("model", requestedModel).Str("tier", econDecision.Tier).Msg("model not found, auto-routing")
+				decision, err = s.Router.SelectProviderAndKey(econDecision.Tier, "", sess.ContextEst)
+			}
+		}
+		if err != nil {
+			// Tier escalation: try higher tiers before giving up
+			for _, higherTier := range []string{"mid", "coder", "premium"} {
+				if router.TierRank(higherTier) <= router.TierRank(econDecision.Tier) {
+					continue
+				}
+				decision, err = s.Router.SelectProviderAndKey(higherTier, "", sess.ContextEst)
+				if err == nil {
+					log.Info().Str("from_tier", econDecision.Tier).Str("to_tier", higherTier).Msg("tier escalated due to exhaustion")
+					break
+				}
+			}
+		}
+		if decision == nil {
+			// Last resort: any healthy provider with any model
+			for _, p := range s.Registry.All() {
+				if p.Pool.IsHealthy() && len(p.Models) > 0 {
+					key, kErr := p.Pool.Select()
+					if kErr == nil {
+						log.Warn().Str("provider", p.Name).Str("model", p.Models[0]).Msg("last resort fallback to any healthy provider")
+						decision = &router.Decision{
+							Tier:     "free",
+							Provider: p,
+							Key:      key,
+							Model:    p.Models[0],
+							Sticky:   false,
+							Reason:   "last_resort_" + p.Name,
+						}
+						break
+					}
+				}
+			}
+		}
+		if decision == nil {
+			log.Error().Str("tier", econDecision.Tier).Str("model", requestedModel).Msg("all providers exhausted across all tiers")
 			metrics.RequestsTotal.WithLabelValues("none", econDecision.Tier, requestedModel, "503").Inc()
 			http.Error(w, "all providers exhausted", http.StatusServiceUnavailable)
 			return
@@ -158,7 +198,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		metrics.StickyDecisions.WithLabelValues("new_binding").Inc()
 	}
 
-	maxRetries := 3
+	maxRetries := 6
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		proxyReq, err := http.NewRequest(http.MethodPost, "http://placeholder/chat/completions", bytes.NewReader(bodyBytes))
 		if err != nil {
@@ -220,10 +260,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			bodyStr := string(body)
-			if isContextLengthError(bodyStr) || isUnknownModelError(bodyStr) || isResourceExhaustedError(bodyStr) {
+
+			isCtxLen := isContextLengthError(bodyStr)
+			isUnknownModel := isUnknownModelError(bodyStr)
+			isRateLimit := isResourceExhaustedError(bodyStr)
+
+			if isCtxLen || isUnknownModel || isRateLimit {
 				reason := "context length exceeded"
-				if isUnknownModelError(bodyStr) {
+				if isUnknownModel {
 					reason = "unknown model"
+				} else if isRateLimit {
+					reason = "resource exhausted"
 				}
 				log.Warn().
 					Str("session", sessionID).
@@ -233,11 +280,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					Str("body_preview", bodyStr[:min(200, len(bodyStr))]).
 					Msg(reason + ", attempting fallback")
 
-				// Cool the key briefly so the router doesn't cycle back to it
 				s.triggerCooldownWithCode(decision, 400, 30*time.Second)
 
 				originalProvider := decision.Provider.Name
-				decision = s.tryContextFallback(decision, econDecision.Tier, sess.ContextEst)
+				// Context-length errors need tryContextFallback (finds models with larger context windows)
+				// Rate-limit and unknown-model errors use tryFallback (standard provider/key rotation)
+				if isCtxLen {
+					decision = s.tryContextFallback(decision, econDecision.Tier, sess.ContextEst)
+				} else {
+					decision = s.tryFallback(decision, econDecision.Tier, requestedModel, sess.ContextEst)
+				}
 				if decision != nil {
 					metrics.FallbackTotal.WithLabelValues(originalProvider, decision.Provider.Name, econDecision.Tier).Inc()
 					continue
@@ -291,14 +343,74 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			isStream = true
 		}
 
-		w.WriteHeader(resp.StatusCode)
+		// For non-streaming: validate response has content before forwarding.
+		// Empty content with no tool_calls poisons conversation history.
+		if !isStream && attempt < maxRetries-1 {
+			respBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
 
-		if isStream {
-			s.streamSSE(w, resp.Body)
+			if isEmptyResponse(respBody) {
+				log.Warn().
+					Str("session", sessionID).
+					Str("provider", decision.Provider.Name).
+					Str("model", decision.Model).
+					Msg("empty response detected, retrying with fallback")
+				s.triggerCooldownWithCode(decision, 200, 15*time.Second)
+				originalProvider := decision.Provider.Name
+				decision = s.tryFallback(decision, econDecision.Tier, requestedModel, sess.ContextEst)
+				if decision != nil {
+					metrics.FallbackTotal.WithLabelValues(originalProvider, decision.Provider.Name, econDecision.Tier).Inc()
+					continue
+				}
+				// No fallback available — send the empty response as-is
+				for k, vv := range resp.Header {
+					w.Header()[k] = vv
+				}
+				w.Header().Set("x-keystone-provider", decision.Provider.Name)
+				w.Header().Set("x-keystone-tier", econDecision.Tier)
+				w.Header().Set("x-keystone-model", "empty_fallback_failed")
+				w.WriteHeader(resp.StatusCode)
+				w.Write(respBody)
+				return
+			}
+
+			// Response is valid — forward it
+			for k, vv := range resp.Header {
+				w.Header()[k] = vv
+			}
+			w.Header().Set("x-keystone-provider", decision.Provider.Name)
+			w.Header().Set("x-keystone-tier", decision.Tier)
+			w.Header().Set("x-keystone-model", decision.Model)
+			w.Header().Set("x-keystone-key", decision.Key.ID)
+			w.Header().Set("x-keystone-sticky", strconv.FormatBool(sticky))
+			w.Header().Set("x-keystone-reason", decision.Reason)
+			w.Header().Set("x-keystone-session", sessionID)
+			w.Header().Set("x-keystone-attempt", strconv.Itoa(attempt+1))
+			w.WriteHeader(resp.StatusCode)
+			w.Write(respBody)
 		} else {
-			io.Copy(w, resp.Body)
+			// Streaming or last attempt — forward directly
+			for k, vv := range resp.Header {
+				w.Header()[k] = vv
+			}
+			w.Header().Set("x-keystone-provider", decision.Provider.Name)
+			w.Header().Set("x-keystone-tier", decision.Tier)
+			w.Header().Set("x-keystone-model", decision.Model)
+			w.Header().Set("x-keystone-key", decision.Key.ID)
+			w.Header().Set("x-keystone-sticky", strconv.FormatBool(sticky))
+			w.Header().Set("x-keystone-reason", decision.Reason)
+			w.Header().Set("x-keystone-session", sessionID)
+			w.Header().Set("x-keystone-attempt", strconv.Itoa(attempt+1))
+
+			w.WriteHeader(resp.StatusCode)
+
+			if isStream {
+				s.streamSSE(w, resp.Body)
+			} else {
+				io.Copy(w, resp.Body)
+			}
+			resp.Body.Close()
 		}
-		resp.Body.Close()
 
 		if !sticky {
 			s.SessionMgr.Bind(sessionID, decision.Key, decision.Provider.Name, decision.Model, decision.Tier)
@@ -402,51 +514,94 @@ func (s *Server) getCooldownDuration(providerName string, statusCode int) time.D
 }
 
 func (s *Server) tryFallback(current *router.Decision, tier, model string, contextTokens int) *router.Decision {
-	// First try another key from the same provider
-	p := current.Provider
-	if p.Pool.IsHealthy() {
-		key, err := p.Pool.Select()
-		if err == nil && key.ID != current.Key.ID {
-			resolved := provider.ResolveModelName(model, p.Name, s.Config.ModelMap)
+	// Determine the actual model we were using (for auto mode, use the resolved model from the failed decision)
+	actualModel := model
+	if actualModel == "" && current.Model != "" {
+		actualModel = current.Model
+	}
+
+	// Step 1: Same model + same provider + different key
+	if actualModel != "" {
+		p := current.Provider
+		if p.Pool.IsHealthy() {
+			key, err := p.Pool.Select()
+			if err == nil && key.ID != current.Key.ID {
+				return &router.Decision{
+					Tier:     tier,
+					Provider: p,
+					Key:      key,
+					Model:    actualModel,
+					Sticky:   false,
+					Reason:   "key_rotation_" + p.Name,
+				}
+			}
+		}
+	}
+
+	// Step 2: Same model + different provider
+	if actualModel != "" && s.Registry != nil {
+		providers := s.Registry.FindProvidersForModel(actualModel)
+		for _, p := range providers {
+			if p.Name == current.Provider.Name {
+				continue
+			}
+			if !p.Pool.IsHealthy() {
+				continue
+			}
+			key, err := p.Pool.Select()
+			if err != nil {
+				continue
+			}
+			resolved := provider.ResolveModelName(actualModel, p.Name, s.Config.ModelMap)
+			if resolved == "" {
+				resolved = actualModel
+			}
 			return &router.Decision{
 				Tier:     tier,
 				Provider: p,
 				Key:      key,
 				Model:    resolved,
 				Sticky:   false,
-				Reason:   "key_rotation_" + p.Name,
+				Reason:   "same_model_" + p.Name,
 			}
 		}
 	}
 
-	lower := router.NextLowerTier(tier)
-	if lower != "" && s.Config.Fallback.CrossTier {
-		dec, err := s.Router.SelectProviderAndKey(lower, "", contextTokens)
-		if err == nil {
-			return dec
-		}
-	}
-
+	// Step 3: Same tier + different model (try each provider in the chain)
 	chain, ok := s.Config.Fallback.Chains[tier]
-	if !ok || len(chain) <= 1 {
-		return nil
-	}
-
-	for _, provName := range chain {
-		if provName == current.Provider.Name {
-			continue
-		}
-		dec, err := s.Router.SelectForProvider(tier, provName)
-		if err == nil {
-			return dec
+	if ok {
+		for _, provName := range chain {
+			if provName == current.Provider.Name {
+				continue
+			}
+			dec, err := s.Router.SelectForProvider(tier, provName)
+			if err == nil {
+				return dec
+			}
 		}
 	}
 
-	// All same-tier providers exhausted — promote to the next higher tier
-	if higher := router.NextHigherTier(tier); higher != "" && s.Config.Fallback.CrossTier {
-		dec, err := s.Router.SelectProviderAndKey(higher, "", contextTokens)
-		if err == nil {
-			return dec
+	// Step 4: Cross-tier — try higher tier first (better quality), then lower
+	if s.Config.Fallback.CrossTier {
+		for _, higherTier := range []string{"premium", "coder", "mid"} {
+			if router.TierRank(higherTier) <= router.TierRank(tier) {
+				continue
+			}
+			dec, err := s.Router.SelectProviderAndKey(higherTier, "", contextTokens)
+			if err == nil {
+				log.Info().Str("from_tier", tier).Str("to_tier", higherTier).Msg("fallback tier escalated")
+				return dec
+			}
+		}
+		for _, lowerTier := range []string{"mid", "coder", "free"} {
+			if router.TierRank(lowerTier) >= router.TierRank(tier) {
+				continue
+			}
+			dec, err := s.Router.SelectProviderAndKey(lowerTier, "", contextTokens)
+			if err == nil {
+				log.Info().Str("from_tier", tier).Str("to_tier", lowerTier).Msg("fallback tier downgraded")
+				return dec
+			}
 		}
 	}
 
@@ -458,6 +613,31 @@ func isResourceExhaustedError(body string) bool {
 	return strings.Contains(lower, "resourceexhausted") ||
 		strings.Contains(lower, "worker local total request limit") ||
 		strings.Contains(lower, "request limit reached")
+}
+
+// isEmptyResponse checks if a non-streaming chat completion response has
+// empty content AND no tool_calls. Such responses poison conversation history.
+func isEmptyResponse(body []byte) bool {
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content      *string `json:"content"`
+				ToolCalls    *any    `json:"tool_calls"`
+				Reasoning    *string `json:"reasoning_content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false
+	}
+	if len(resp.Choices) == 0 {
+		return true
+	}
+	msg := resp.Choices[0].Message
+	// Content is empty if it's null or empty string
+	contentEmpty := msg.Content == nil || *msg.Content == ""
+	toolCallsEmpty := msg.ToolCalls == nil
+	return contentEmpty && toolCallsEmpty
 }
 
 func isContextLengthError(body string) bool {

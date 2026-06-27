@@ -38,13 +38,13 @@ models:
 
   - id: nemotron-ultra
     display_name: "NVIDIA Nemotron 3 Ultra 550B"
-    context_window: 1000000
+    context_window: 262144
     status: "available"
     tiers: ["premium"]
-    strengths: ["long_context", "reasoning"]
+    strengths: ["reasoning", "balanced"]
     providers:
       - name: nvidia
-        model_name: "nvidia/nemotron-3-ultra-550b"
+        model_name: "nvidia/nemotron-3-ultra-550b-a55b"
         free_tier:
           rate_limit_rpm: 40
           signup_url: "https://build.nvidia.com"
