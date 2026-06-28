@@ -62,6 +62,7 @@ type ProviderConfig struct {
 	Models   []string       `yaml:"models"`
 	Cooldown CooldownConfig `yaml:"cooldown"`
 	RateLimit RateLimitConfig `yaml:"rate_limit"`
+	MaxConcurrent int       `yaml:"max_concurrent"`
 }
 
 type KeyConfig struct {

@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/clawdbot/keystone/internal/classify"
@@ -32,6 +33,9 @@ type Server struct {
 	Classifier  classify.Classifier
 	API         *apiAdapter
 	client      *http.Client
+	inFlight    map[string]int    // provider name → active request count
+	maxConcurrent map[string]int  // provider name → max concurrent
+	mu          sync.Mutex
 }
 
 type apiAdapter struct {
@@ -39,7 +43,7 @@ type apiAdapter struct {
 }
 
 func New(cfg *config.Config, reg *provider.Registry, rt *router.Router, modelReg *registry.ModelRegistry, sm *session.Manager, econ *economics.Engine, cls classify.Classifier, modeFn func() string) *Server {
-	return &Server{
+	s := &Server{
 		Config:     cfg,
 		Registry:   reg,
 		Router:     rt,
@@ -57,7 +61,43 @@ func New(cfg *config.Config, reg *provider.Registry, rt *router.Router, modelReg
 				return http.ErrUseLastResponse
 			},
 		},
+		inFlight:      make(map[string]int),
+		maxConcurrent: make(map[string]int),
 	}
+	// Load per-provider concurrency limits from config
+	for _, pc := range cfg.Providers {
+		if pc.MaxConcurrent > 0 {
+			s.maxConcurrent[pc.Name] = pc.MaxConcurrent
+		}
+	}
+	return s
+}
+
+// canSend checks if a provider has capacity for another concurrent request
+func (s *Server) canSend(providerName string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	max, ok := s.maxConcurrent[providerName]
+	if !ok || max <= 0 {
+		return true // no limit configured
+	}
+	return s.inFlight[providerName] < max
+}
+
+// acquire increments the in-flight counter for a provider
+func (s *Server) acquire(providerName string) {
+	s.mu.Lock()
+	s.inFlight[providerName]++
+	s.mu.Unlock()
+}
+
+// release decrements the in-flight counter for a provider
+func (s *Server) release(providerName string) {
+	s.mu.Lock()
+	if s.inFlight[providerName] > 0 {
+		s.inFlight[providerName]--
+	}
+	s.mu.Unlock()
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -224,7 +264,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	maxRetries := 6
+	acquiredProvider := ""
 	for attempt := 0; attempt < maxRetries; attempt++ {
+		// Release previous provider's concurrency slot
+		if acquiredProvider != "" {
+			s.release(acquiredProvider)
+			acquiredProvider = ""
+		}
 		proxyReq, err := http.NewRequest(http.MethodPost, "http://placeholder/chat/completions", bytes.NewReader(bodyBytes))
 		if err != nil {
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -244,8 +290,23 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
+		// Concurrency check: skip provider if at max concurrent requests
+		if !s.canSend(decision.Provider.Name) {
+			log.Warn().Str("provider", decision.Provider.Name).Msg("provider at max concurrency, trying fallback")
+			originalProvider := decision.Provider.Name
+			decision = s.tryFallback(decision, econDecision.Tier, requestedModel, sess.ContextEst)
+			if decision != nil {
+				metrics.FallbackTotal.WithLabelValues(originalProvider, decision.Provider.Name, econDecision.Tier).Inc()
+				continue
+			}
+		}
+
+		s.acquire(decision.Provider.Name)
+		acquiredProvider = decision.Provider.Name
 		resp, err := s.client.Do(proxyReq)
 		if err != nil {
+			s.release(acquiredProvider)
+			acquiredProvider = ""
 			log.Error().Err(err).Str("provider", decision.Provider.Name).Msg("upstream request failed")
 			s.triggerCooldown(decision, 502)
 			decision = s.tryFallback(decision, econDecision.Tier, requestedModel, sess.ContextEst)
@@ -501,6 +562,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if acquiredProvider != "" {
+		s.release(acquiredProvider)
+	}
 	http.Error(w, "all retries exhausted", http.StatusBadGateway)
 }
 
