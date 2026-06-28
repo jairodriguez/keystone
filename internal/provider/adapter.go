@@ -130,6 +130,17 @@ func RewriteRequest(req *http.Request, provider *Provider, key *keypool.Key, mod
 			delete(body, "thinking")
 			delete(body, "reasoning_effort")
 			delete(body, "reasoning")
+			// Strip reasoning_content from conversation history — causes empty responses
+			// and "reasoning_content must be passed back" errors on models that don't support it
+			if msgs, ok := body["messages"].([]any); ok {
+				for _, m := range msgs {
+					if msg, ok := m.(map[string]any); ok {
+						delete(msg, "reasoning_content")
+						delete(msg, "reasoning")
+						delete(msg, "reasoning_details")
+					}
+				}
+			}
 			newBytes, _ := json.Marshal(body)
 			req.Body = io.NopCloser(bytes.NewReader(newBytes))
 			req.ContentLength = int64(len(newBytes))
