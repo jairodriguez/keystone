@@ -414,27 +414,68 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(resp.StatusCode)
 			w.Write(respBody)
 		} else {
-			// Streaming or last attempt — forward directly
-			for k, vv := range resp.Header {
-				w.Header()[k] = vv
-			}
-			w.Header().Set("x-keystone-provider", decision.Provider.Name)
-			w.Header().Set("x-keystone-tier", decision.Tier)
-			w.Header().Set("x-keystone-model", decision.Model)
-			w.Header().Set("x-keystone-key", decision.Key.ID)
-			w.Header().Set("x-keystone-sticky", strconv.FormatBool(sticky))
-			w.Header().Set("x-keystone-reason", decision.Reason)
-			w.Header().Set("x-keystone-session", sessionID)
-			w.Header().Set("x-keystone-attempt", strconv.Itoa(attempt+1))
+			// Streaming or last attempt
+			if isStream && attempt < maxRetries-1 {
+				// Buffer stream, check for empty content before forwarding
+				streamData, hasContent := bufferAndCheckSSE(resp.Body)
+				resp.Body.Close()
 
-			w.WriteHeader(resp.StatusCode)
+				if !hasContent {
+					log.Warn().
+						Str("session", sessionID).
+						Str("provider", decision.Provider.Name).
+						Str("model", decision.Model).
+						Msg("empty streaming response detected, retrying with fallback")
+					s.triggerCooldownWithCode(decision, 200, 15*time.Second)
+					originalProvider := decision.Provider.Name
+					decision = s.tryFallback(decision, econDecision.Tier, requestedModel, sess.ContextEst)
+					if decision != nil {
+						metrics.FallbackTotal.WithLabelValues(originalProvider, decision.Provider.Name, econDecision.Tier).Inc()
+						continue
+					}
+					// No fallback — inject minimal placeholder so conversation isn't poisoned
+					streamData = []byte("data: {\"choices\":[{\"delta\":{\"content\":\"I apologize, but I couldn't generate a response. Please try again.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+				}
 
-			if isStream {
-				s.streamSSE(w, resp.Body)
+				for k, vv := range resp.Header {
+					w.Header()[k] = vv
+				}
+				w.Header().Set("x-keystone-provider", decision.Provider.Name)
+				w.Header().Set("x-keystone-tier", decision.Tier)
+				w.Header().Set("x-keystone-model", decision.Model)
+				w.Header().Set("x-keystone-key", decision.Key.ID)
+				w.Header().Set("x-keystone-sticky", strconv.FormatBool(sticky))
+				w.Header().Set("x-keystone-reason", decision.Reason)
+				w.Header().Set("x-keystone-session", sessionID)
+				w.Header().Set("x-keystone-attempt", strconv.Itoa(attempt+1))
+				w.WriteHeader(resp.StatusCode)
+				w.Write(streamData)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
 			} else {
-				io.Copy(w, resp.Body)
+				// Non-streaming last attempt or non-streaming — forward directly
+				for k, vv := range resp.Header {
+					w.Header()[k] = vv
+				}
+				w.Header().Set("x-keystone-provider", decision.Provider.Name)
+				w.Header().Set("x-keystone-tier", decision.Tier)
+				w.Header().Set("x-keystone-model", decision.Model)
+				w.Header().Set("x-keystone-key", decision.Key.ID)
+				w.Header().Set("x-keystone-sticky", strconv.FormatBool(sticky))
+				w.Header().Set("x-keystone-reason", decision.Reason)
+				w.Header().Set("x-keystone-session", sessionID)
+				w.Header().Set("x-keystone-attempt", strconv.Itoa(attempt+1))
+
+				w.WriteHeader(resp.StatusCode)
+
+				if isStream {
+					s.streamSSE(w, resp.Body)
+				} else {
+					io.Copy(w, resp.Body)
+				}
+				resp.Body.Close()
 			}
-			resp.Body.Close()
 		}
 
 		if !sticky {
@@ -484,6 +525,46 @@ func (s *Server) streamSSE(w http.ResponseWriter, body io.ReadCloser) {
 			return
 		}
 	}
+}
+
+// bufferAndCheckSSE reads an SSE stream into memory and checks whether any
+// content was actually generated. Returns the raw bytes and whether content was found.
+func bufferAndCheckSSE(body io.ReadCloser) ([]byte, bool) {
+	data, err := io.ReadAll(body)
+	if err != nil {
+		return data, true // on error, assume non-empty to avoid false positives
+	}
+
+	hasContent := false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		chunk := strings.TrimPrefix(line, "data: ")
+		if chunk == "[DONE]" {
+			continue
+		}
+		var event struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if json.Unmarshal([]byte(chunk), &event) == nil {
+			for _, c := range event.Choices {
+				if c.Delta.Content != "" {
+					hasContent = true
+					break
+				}
+			}
+		}
+		if hasContent {
+			break
+		}
+	}
+	return data, hasContent
 }
 
 func (s *Server) triggerCooldown(decision *router.Decision, statusCode int) {
