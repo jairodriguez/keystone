@@ -100,6 +100,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	sess := s.SessionMgr.GetOrCreate(sessionID, agent)
 
+	// Heal poisoned conversation history: remove assistant messages with empty content AND no tool_calls.
+	// These get created when a model returns empty, and they cause 400 errors on all subsequent requests.
+	if msgs, ok := reqBody["messages"].([]any); ok {
+		healed := false
+		cleaned := make([]any, 0, len(msgs))
+		for _, m := range msgs {
+			if msg, ok := m.(map[string]any); ok {
+				if role, _ := msg["role"].(string); role == "assistant" {
+					content, _ := msg["content"].(string)
+					toolCalls := msg["tool_calls"]
+					if content == "" && toolCalls == nil {
+						healed = true
+						continue
+					}
+				}
+			}
+			cleaned = append(cleaned, m)
+		}
+		if healed {
+			reqBody["messages"] = cleaned
+			bodyBytes, _ = json.Marshal(reqBody)
+			log.Warn().Str("session", sessionID).Int("removed", len(msgs)-len(cleaned)).Msg("healed poisoned assistant messages from conversation")
+		}
+	}
+
 	clsResult := s.Classifier.Classify(
 		extractPrompt(reqBody),
 		sess.ContextEst,
